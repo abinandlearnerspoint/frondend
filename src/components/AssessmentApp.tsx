@@ -1,23 +1,137 @@
-import { useState, useCallback } from "react";
-import { questions } from "@/data/questions";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import AssessmentTimer from "./AssessmentTimer";
 import ResultScreen from "./ResultScreen";
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import { useParams } from "react-router-dom";
 
-const TIMER_DURATION = 45;
+type Question = {
+  id: number;
+  question: string;
+  options: string[];
+  correct_index: number;
+};
+
+type AssessmentResponse = {
+  type?: string;
+  timer_seconds?: number;
+  seconds_per_question?: number;
+  questions?: unknown;
+};
+
+const DEFAULT_TIMER_SECONDS = 45;
+const API_BASE = import.meta.env.VITE_ASSESSMENT_API_BASE_URL ?? "";
+const API_KEY = import.meta.env.VITE_ASSESSMENT_API_KEY ?? "";
+
+const normalizeQuestion = (raw: unknown, idx: number): Question | null => {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const id = Number(obj.id ?? idx + 1);
+  const question = typeof obj.question === "string" ? obj.question.trim() : "";
+  const optionsRaw = Array.isArray(obj.options) ? obj.options : [];
+  const options = optionsRaw.map((x) => String(x ?? "")).filter(Boolean);
+  const correct =
+    typeof obj.correct_index === "number"
+      ? obj.correct_index
+      : typeof obj.correct === "number"
+        ? obj.correct
+        : -1;
+
+  if (!question || options.length === 0 || correct < 0 || correct >= options.length) return null;
+  return { id, question, options, correct_index: correct };
+};
 
 const AssessmentApp = () => {
+  const { id, phase } = useParams<{ id: string; phase?: string }>();
+  const phaseFromUrl = phase === "pre" || phase === "post" ? phase : "post";
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [assessmentType, setAssessmentType] = useState("post");
+  const [timerDuration, setTimerDuration] = useState(DEFAULT_TIMER_SECONDS);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<number, number>>({});
   const [finished, setFinished] = useState(false);
   const [timerKey, setTimerKey] = useState(0);
 
-  const q = questions[currentIndex];
+  useEffect(() => {
+    if (!id) {
+      setLoading(false);
+      setLoadError("Missing assessment id in URL.");
+      return;
+    }
+
+    let cancelled = false;
+    const loadAssessment = async () => {
+      setLoading(true);
+      setLoadError(null);
+      try {
+        const endpoint = `${API_BASE}/api/v1/assessment/${encodeURIComponent(id)}/${phaseFromUrl}`;
+        const res = await fetch(endpoint, {
+          headers: API_KEY ? { "x-api-key": API_KEY } : undefined,
+        });
+        if (!res.ok) {
+          let detail = "";
+          try {
+            const err = (await res.json()) as { detail?: unknown };
+            detail = typeof err.detail === "string" ? err.detail : "";
+          } catch {
+            detail = "";
+          }
+          if (res.status === 409) {
+            throw new Error(detail || "Slides are still processing. Please try again shortly.");
+          }
+          if (res.status >= 500) {
+            throw new Error(detail || "Server error while loading assessment. Please retry.");
+          }
+          throw new Error(detail || `Failed to load assessment (${res.status})`);
+        }
+
+        const data = (await res.json()) as AssessmentResponse;
+        const rawQuestions = Array.isArray(data.questions) ? data.questions : [];
+        const normalized = rawQuestions
+          .map((q, i) => normalizeQuestion(q, i))
+          .filter((q): q is Question => q !== null);
+
+        if (cancelled) return;
+
+        setQuestions(normalized);
+        setAssessmentType(typeof data.type === "string" ? data.type : phaseFromUrl);
+        setTimerDuration(
+          Math.max(
+            10,
+            Number(data.seconds_per_question ?? data.timer_seconds ?? DEFAULT_TIMER_SECONDS),
+          ),
+        );
+        setCurrentIndex(0);
+        setAnswers({});
+        setFinished(false);
+        setTimerKey((k) => k + 1);
+      } catch (error) {
+        if (cancelled) return;
+        setLoadError(error instanceof Error ? error.message : "Unable to load assessment.");
+        setQuestions([]);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    void loadAssessment();
+    return () => {
+      cancelled = true;
+    };
+  }, [id, phaseFromUrl, reloadKey]);
+
   const total = questions.length;
-  const progress = ((currentIndex + 1) / total) * 100;
+  const q = questions[currentIndex];
+  const progress = useMemo(() => {
+    if (!total) return 0;
+    return ((currentIndex + 1) / total) * 100;
+  }, [currentIndex, total]);
 
   const selectOption = (optIdx: number) => {
+    if (!q) return;
     if (answers[q.id] !== undefined) return;
     setAnswers((prev) => ({ ...prev, [q.id]: optIdx }));
   };
@@ -39,12 +153,13 @@ const AssessmentApp = () => {
   };
 
   const handleTimeUp = useCallback(() => {
+    if (!q) return;
     // auto-advance if no answer selected
     if (answers[q.id] === undefined) {
       setAnswers((prev) => ({ ...prev, [q.id]: -1 })); // -1 = timed out
     }
     goNext();
-  }, [answers, q.id, goNext]);
+  }, [answers, q, goNext]);
 
   const restart = () => {
     setCurrentIndex(0);
@@ -53,8 +168,32 @@ const AssessmentApp = () => {
     setTimerKey((k) => k + 1);
   };
 
+  if (loading) {
+    return <div className="min-h-screen grid place-items-center text-muted-foreground">Loading assessment...</div>;
+  }
+
+  if (loadError) {
+    return (
+      <div className="min-h-screen grid place-items-center p-6">
+        <div className="text-center space-y-3">
+          <p className="text-destructive">{loadError}</p>
+          <button
+            onClick={() => setReloadKey((k) => k + 1)}
+            className="px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!total || !q) {
+    return <div className="min-h-screen grid place-items-center text-muted-foreground">No questions found.</div>;
+  }
+
   if (finished) {
-    return <ResultScreen answers={answers} onRestart={restart} />;
+    return <ResultScreen answers={answers} questions={questions} assessmentType={assessmentType} onRestart={restart} />;
   }
 
   const selected = answers[q.id];
@@ -66,7 +205,7 @@ const AssessmentApp = () => {
         {/* Header */}
         <div className="mb-6">
           <h1 className="font-display text-xl sm:text-2xl font-bold text-foreground mb-1">
-            CSM Post Assessment
+            CSM {assessmentType === "pre" ? "Pre" : "Post"} Assessment
           </h1>
           <div className="flex items-center justify-between text-sm text-muted-foreground mb-3">
             <span>Question {currentIndex + 1} of {total}</span>
@@ -83,7 +222,7 @@ const AssessmentApp = () => {
             />
           </div>
           <AssessmentTimer
-            duration={TIMER_DURATION}
+            duration={timerDuration}
             onTimeUp={handleTimeUp}
             resetKey={timerKey}
           />

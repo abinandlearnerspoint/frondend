@@ -1,13 +1,22 @@
-import { questions } from "@/data/questions";
+import { useEffect } from "react";
 import { motion } from "framer-motion";
 import { RotateCcw, CheckCircle2, XCircle, Clock } from "lucide-react";
 
+type Question = {
+  id: number;
+  question: string;
+  options: string[];
+  correct_index: number;
+};
+
 interface ResultScreenProps {
   answers: Record<number, number>;
+  questions: Question[];
+  assessmentType?: string;
   onRestart: () => void;
 }
 
-const ResultScreen = ({ answers, onRestart }: ResultScreenProps) => {
+const ResultScreen = ({ answers, questions, assessmentType, onRestart }: ResultScreenProps) => {
   const total = questions.length;
   const correct = questions.filter((q) => answers[q.id] === q.correct_index).length;
   const timedOut = questions.filter((q) => answers[q.id] === -1).length;
@@ -16,6 +25,20 @@ const ResultScreen = ({ answers, onRestart }: ResultScreenProps) => {
 
   const grade =
     pct >= 90 ? "Excellent" : pct >= 70 ? "Good" : pct >= 50 ? "Needs Improvement" : "Review Required";
+
+  useEffect(() => {
+    const api = (window as Window & { API?: any }).API;
+    if (!api) return;
+    try {
+      api.LMSInitialize?.("");
+      api.LMSSetValue?.("cmi.score.raw", String(pct));
+      api.LMSSetValue?.("cmi.completion_status", "completed");
+      api.LMSCommit?.("");
+      api.LMSFinish?.("");
+    } catch (error) {
+      console.error("SCORM reporting failed", error);
+    }
+  }, [pct]);
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4 sm:p-6">
@@ -27,7 +50,9 @@ const ResultScreen = ({ answers, onRestart }: ResultScreenProps) => {
         <h1 className="font-display text-2xl sm:text-3xl font-bold text-foreground mb-2">
           Assessment Complete
         </h1>
-        <p className="text-muted-foreground text-sm mb-6">CSM Post Assessment Results</p>
+        <p className="text-muted-foreground text-sm mb-6">
+          CSM {assessmentType === "pre" ? "Pre" : "Post"} Assessment Results
+        </p>
 
         {/* Score circle */}
         <div className="relative mx-auto w-32 h-32 mb-6">

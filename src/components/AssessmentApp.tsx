@@ -68,8 +68,15 @@ const AssessmentApp = () => {
       setLoadError(null);
       try {
         const endpoint = `${API_BASE}/api/v1/assessment/${encodeURIComponent(id)}/${phaseFromUrl}`;
+        const requestHeaders: Record<string, string> = {
+          // Prevent ngrok browser warning page from breaking JSON fetches.
+          "ngrok-skip-browser-warning": "true",
+        };
+        if (API_KEY) {
+          requestHeaders["x-api-key"] = API_KEY;
+        }
         const res = await fetch(endpoint, {
-          headers: API_KEY ? { "x-api-key": API_KEY } : undefined,
+          headers: requestHeaders,
         });
         if (!res.ok) {
           let detail = "";

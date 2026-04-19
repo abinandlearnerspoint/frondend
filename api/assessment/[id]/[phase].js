@@ -80,6 +80,12 @@ export default async function handler(req, res) {
         headers: {
           "X-API-Key": API_KEY,
           Accept: "application/json",
+          // Bypass ngrok free-tier browser warning interstitial. Harmless when
+          // the backend is hosted elsewhere (non-ngrok hosts ignore it).
+          "ngrok-skip-browser-warning": "true",
+          // Identify ourselves as a non-browser client so ngrok / Cloudflare /
+          // any reverse proxy forwards us straight through.
+          "User-Agent": "lp-assessment-proxy/1.0 (+vercel)",
         },
       },
       UPSTREAM_TIMEOUT_MS,
@@ -94,11 +100,32 @@ export default async function handler(req, res) {
     });
   }
 
+  // Read once as text, then try JSON. This way, if the upstream returns HTML
+  // (e.g. ngrok warning page, FastAPI 500 page, Cloudflare error), we can
+  // surface the actual content-type + status + first bytes for debugging
+  // instead of the opaque "non-JSON response" message.
+  const contentType = upstreamRes.headers.get("content-type") || "";
+  const rawText = await upstreamRes.text();
   let body;
-  try {
-    body = await upstreamRes.json();
-  } catch {
-    body = { error: "Backend returned non-JSON response." };
+  if (contentType.includes("application/json")) {
+    try {
+      body = JSON.parse(rawText);
+    } catch {
+      body = {
+        error: "Backend returned malformed JSON.",
+        upstream_status: upstreamRes.status,
+        upstream_content_type: contentType,
+        upstream_excerpt: rawText.slice(0, 500),
+      };
+    }
+  } else {
+    body = {
+      error:
+        "Backend returned a non-JSON response (likely an ngrok warning, gateway error, or HTML page).",
+      upstream_status: upstreamRes.status,
+      upstream_content_type: contentType || "(none)",
+      upstream_excerpt: rawText.slice(0, 500),
+    };
   }
   // Surface upstream rate-limit headers transparently so the client can show
   // a friendly message.
@@ -106,5 +133,12 @@ export default async function handler(req, res) {
   if (retryAfter) {
     res.setHeader("Retry-After", retryAfter);
   }
-  return jsonResponse(res, upstreamRes.status, body);
+  // If the upstream was non-JSON, force a 502 so the client treats it as an
+  // error and shows the Try-Again button rather than a "200 OK with no
+  // questions" empty screen.
+  const finalStatus =
+    !contentType.includes("application/json") && upstreamRes.status === 200
+      ? 502
+      : upstreamRes.status;
+  return jsonResponse(res, finalStatus, body);
 }

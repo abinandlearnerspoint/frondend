@@ -215,14 +215,32 @@ const AssessmentApp = () => {
         if (!res.ok) {
           let detail = "";
           try {
-            const err = (await res.json()) as { detail?: unknown; error?: unknown };
+            const err = (await res.json()) as {
+              detail?: unknown;
+              error?: unknown;
+              upstream_status?: unknown;
+              upstream_content_type?: unknown;
+              upstream_excerpt?: unknown;
+            };
             const candidate =
               typeof err.detail === "string"
                 ? err.detail
                 : typeof err.error === "string"
                   ? err.error
                   : "";
-            detail = candidate;
+            const debugBits: string[] = [];
+            if (typeof err.upstream_status === "number")
+              debugBits.push(`upstream ${err.upstream_status}`);
+            if (typeof err.upstream_content_type === "string")
+              debugBits.push(err.upstream_content_type);
+            const excerpt =
+              typeof err.upstream_excerpt === "string"
+                ? err.upstream_excerpt.replace(/\s+/g, " ").trim().slice(0, 160)
+                : "";
+            detail =
+              candidate +
+              (debugBits.length ? ` (${debugBits.join(" / ")})` : "") +
+              (excerpt ? ` — ${excerpt}` : "");
           } catch {
             detail = "";
           }

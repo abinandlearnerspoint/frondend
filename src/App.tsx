@@ -17,6 +17,10 @@ const App = () => (
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Index />} />
+          {/* New courseware-assessments URL pattern (matches backend slides job links). */}
+          <Route path="/assessment/:id/:phase" element={<AssessmentApp />} />
+          <Route path="/assessment/:id" element={<AssessmentApp />} />
+          {/* Legacy patterns kept for backwards compatibility. */}
           <Route path="/quiz/:phase/:id" element={<AssessmentApp />} />
           <Route path="/quiz/:id" element={<AssessmentApp />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}

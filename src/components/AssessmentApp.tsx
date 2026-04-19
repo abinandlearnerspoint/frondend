@@ -1,9 +1,9 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import AssessmentTimer from "./AssessmentTimer";
 import ResultScreen from "./ResultScreen";
-import { ChevronLeft, ChevronRight } from "lucide-react";
-import { useParams } from "react-router-dom";
+import { ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
+import { useParams, useSearchParams } from "react-router-dom";
 
 type Question = {
   id: number;
@@ -14,14 +14,72 @@ type Question = {
 
 type AssessmentResponse = {
   type?: string;
+  phase?: string;
   timer_seconds?: number;
   seconds_per_question?: number;
   questions?: unknown;
+  num_questions?: number;
+  difficulty?: string;
+  course_name?: string;
+  content_hash?: string;
+};
+
+// Stored copy of a successfully-loaded session, keyed per (id, phase).
+// Persisted ONLY in sessionStorage so accidental refreshes / tab restores keep
+// the same questions + answers — but a deliberate "Try Again" wipes it and
+// asks the backend for a fresh, freshly-generated set.
+type StoredSession = {
+  questions: Question[];
+  assessmentType: string;
+  timerDuration: number;
+  contentHash?: string;
+  courseName?: string;
+  difficulty?: string;
+  answers: Record<number, number>;
+  currentIndex: number;
+  finished: boolean;
+  ts: number;
 };
 
 const DEFAULT_TIMER_SECONDS = 45;
-const API_BASE = import.meta.env.VITE_ASSESSMENT_API_BASE_URL ?? "";
-const API_KEY = import.meta.env.VITE_ASSESSMENT_API_KEY ?? "";
+// Same-origin Vercel function proxy. Keep this path stable — the slides job
+// stamps the URL into Zoho once and shouldn't rotate.
+const PROXY_PATH_BASE = "/api/assessment";
+// Soft client-side timeout. Backend LLM calls can take 30–60s; the upstream
+// proxy enforces ~110s. We give the user something to look at and a button
+// to retry without re-issuing the link.
+const CLIENT_TIMEOUT_MS = 90_000;
+
+const sessionKey = (id: string, phase: string, token: string | null) =>
+  `cwa:${id}:${phase}${token ? `:${token.slice(0, 8)}` : ""}`;
+
+const loadStoredSession = (key: string): StoredSession | null => {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredSession;
+    if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const persistSession = (key: string, session: StoredSession) => {
+  try {
+    sessionStorage.setItem(key, JSON.stringify(session));
+  } catch {
+    // sessionStorage may be unavailable (private mode, etc.) — silently degrade.
+  }
+};
+
+const clearSession = (key: string) => {
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    /* noop */
+  }
+};
 
 const normalizeQuestion = (raw: unknown, idx: number): Question | null => {
   if (!raw || typeof raw !== "object") return null;
@@ -43,9 +101,18 @@ const normalizeQuestion = (raw: unknown, idx: number): Question | null => {
 
 const AssessmentApp = () => {
   const { id, phase } = useParams<{ id: string; phase?: string }>();
-  const phaseFromUrl = phase === "pre" || phase === "post" ? phase : "post";
+  const [searchParams] = useSearchParams();
+  const phaseFromUrl: "pre" | "post" =
+    phase === "pre" || phase === "post" ? phase : "post";
+  // Optional signed token forwarded to the backend (kept in sessionStorage key
+  // so a token rotation = a fresh question set on reopen).
+  const linkToken = searchParams.get("t");
+  // Optional difficulty / num_questions overrides via URL.
+  const difficultyOverride = searchParams.get("difficulty");
+  const numQuestionsOverride = searchParams.get("num_questions");
+
   const [questions, setQuestions] = useState<Question[]>([]);
-  const [assessmentType, setAssessmentType] = useState("post");
+  const [assessmentType, setAssessmentType] = useState<string>(phaseFromUrl);
   const [timerDuration, setTimerDuration] = useState(DEFAULT_TIMER_SECONDS);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -54,6 +121,43 @@ const AssessmentApp = () => {
   const [answers, setAnswers] = useState<Record<number, number>>({});
   const [finished, setFinished] = useState(false);
   const [timerKey, setTimerKey] = useState(0);
+  const [generationStartedAt, setGenerationStartedAt] = useState<number | null>(null);
+  const [restoredFromSession, setRestoredFromSession] = useState(false);
+
+  // Persist progress to sessionStorage on every meaningful change so an
+  // accidental reload doesn't lose answers or jump back to question 1.
+  const persistTimer = useRef<number | null>(null);
+  useEffect(() => {
+    if (!id || questions.length === 0) return;
+    const key = sessionKey(id, phaseFromUrl, linkToken);
+    if (persistTimer.current) {
+      window.clearTimeout(persistTimer.current);
+    }
+    persistTimer.current = window.setTimeout(() => {
+      persistSession(key, {
+        questions,
+        assessmentType,
+        timerDuration,
+        answers,
+        currentIndex,
+        finished,
+        ts: Date.now(),
+      });
+    }, 150);
+    return () => {
+      if (persistTimer.current) window.clearTimeout(persistTimer.current);
+    };
+  }, [
+    id,
+    phaseFromUrl,
+    linkToken,
+    questions,
+    assessmentType,
+    timerDuration,
+    answers,
+    currentIndex,
+    finished,
+  ]);
 
   useEffect(() => {
     if (!id) {
@@ -62,32 +166,86 @@ const AssessmentApp = () => {
       return;
     }
 
+    const key = sessionKey(id, phaseFromUrl, linkToken);
+
+    // On the first mount for this (id, phase, token), prefer the stored
+    // session if one exists so refresh / back-forward navigation does NOT
+    // burn another LLM call. Explicit "Get new questions" wipes the key.
+    if (reloadKey === 0) {
+      const stored = loadStoredSession(key);
+      if (stored) {
+        setQuestions(stored.questions);
+        setAssessmentType(stored.assessmentType);
+        setTimerDuration(stored.timerDuration);
+        setAnswers(stored.answers || {});
+        setCurrentIndex(stored.currentIndex || 0);
+        setFinished(Boolean(stored.finished));
+        setLoading(false);
+        setLoadError(null);
+        setRestoredFromSession(true);
+        return;
+      }
+    }
+
+    setRestoredFromSession(false);
+
+    const controller = new AbortController();
+    const timeoutTimer = window.setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
     let cancelled = false;
+
     const loadAssessment = async () => {
       setLoading(true);
       setLoadError(null);
+      setGenerationStartedAt(Date.now());
       try {
-        const endpoint = `${API_BASE}/api/v1/assessment/${encodeURIComponent(id)}/${phaseFromUrl}`;
-        const requestHeaders: Record<string, string> = {
-          // Prevent ngrok browser warning page from breaking JSON fetches.
-          "ngrok-skip-browser-warning": "true",
-        };
-        if (API_KEY) {
-          requestHeaders["x-api-key"] = API_KEY;
-        }
+        const params = new URLSearchParams();
+        if (linkToken) params.set("t", linkToken);
+        if (difficultyOverride) params.set("difficulty", difficultyOverride);
+        if (numQuestionsOverride) params.set("num_questions", numQuestionsOverride);
+        const qs = params.toString();
+        const endpoint =
+          `${PROXY_PATH_BASE}/${encodeURIComponent(id)}/${phaseFromUrl}` +
+          (qs ? `?${qs}` : "");
+
         const res = await fetch(endpoint, {
-          headers: requestHeaders,
+          method: "GET",
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
         });
         if (!res.ok) {
           let detail = "";
           try {
-            const err = (await res.json()) as { detail?: unknown };
-            detail = typeof err.detail === "string" ? err.detail : "";
+            const err = (await res.json()) as { detail?: unknown; error?: unknown };
+            const candidate =
+              typeof err.detail === "string"
+                ? err.detail
+                : typeof err.error === "string"
+                  ? err.error
+                  : "";
+            detail = candidate;
           } catch {
             detail = "";
           }
-          if (res.status === 409) {
-            throw new Error(detail || "Slides are still processing. Please try again shortly.");
+          if (res.status === 404) {
+            throw new Error(
+              detail ||
+                "Your courseware is still being prepared. Please try again in a few minutes.",
+            );
+          }
+          if (res.status === 429) {
+            const retryAfter = res.headers.get("Retry-After");
+            throw new Error(
+              detail ||
+                `Too many requests right now. Please wait${
+                  retryAfter ? ` ${retryAfter}s` : ""
+                } and try again.`,
+            );
+          }
+          if (res.status === 504) {
+            throw new Error(
+              detail ||
+                "Question generation timed out. Try again — this can take up to a minute.",
+            );
           }
           if (res.status >= 500) {
             throw new Error(detail || "Server error while loading assessment. Please retry.");
@@ -103,32 +261,81 @@ const AssessmentApp = () => {
 
         if (cancelled) return;
 
-        setQuestions(normalized);
-        setAssessmentType(typeof data.type === "string" ? data.type : phaseFromUrl);
-        setTimerDuration(
-          Math.max(
-            10,
-            Number(data.seconds_per_question ?? data.timer_seconds ?? DEFAULT_TIMER_SECONDS),
-          ),
+        if (normalized.length === 0) {
+          throw new Error(
+            "The model returned no usable questions. Please try again in a moment.",
+          );
+        }
+
+        const nextType =
+          typeof data.phase === "string"
+            ? data.phase
+            : typeof data.type === "string"
+              ? data.type
+              : phaseFromUrl;
+        const nextTimer = Math.max(
+          10,
+          Number(data.seconds_per_question ?? data.timer_seconds ?? DEFAULT_TIMER_SECONDS),
         );
+
+        setQuestions(normalized);
+        setAssessmentType(nextType);
+        setTimerDuration(nextTimer);
         setCurrentIndex(0);
         setAnswers({});
         setFinished(false);
         setTimerKey((k) => k + 1);
+        // Eagerly persist the freshly-generated set so a refresh during the
+        // very first second still preserves the questions.
+        persistSession(sessionKey(id, phaseFromUrl, linkToken), {
+          questions: normalized,
+          assessmentType: nextType,
+          timerDuration: nextTimer,
+          contentHash: data.content_hash,
+          courseName: data.course_name,
+          difficulty: data.difficulty,
+          answers: {},
+          currentIndex: 0,
+          finished: false,
+          ts: Date.now(),
+        });
       } catch (error) {
         if (cancelled) return;
-        setLoadError(error instanceof Error ? error.message : "Unable to load assessment.");
+        const msg =
+          error instanceof DOMException && error.name === "AbortError"
+            ? "Question generation is taking longer than expected. Please try again — your link is still valid."
+            : error instanceof Error
+              ? error.message
+              : "Unable to load assessment.";
+        setLoadError(msg);
         setQuestions([]);
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setGenerationStartedAt(null);
+        }
+        window.clearTimeout(timeoutTimer);
       }
     };
 
     void loadAssessment();
     return () => {
       cancelled = true;
+      window.clearTimeout(timeoutTimer);
+      controller.abort();
     };
-  }, [id, phaseFromUrl, reloadKey]);
+  }, [id, phaseFromUrl, linkToken, difficultyOverride, numQuestionsOverride, reloadKey]);
+
+  const requestNewQuestions = useCallback(() => {
+    if (!id) return;
+    clearSession(sessionKey(id, phaseFromUrl, linkToken));
+    setQuestions([]);
+    setAnswers({});
+    setCurrentIndex(0);
+    setFinished(false);
+    setLoadError(null);
+    setReloadKey((k) => k + 1);
+  }, [id, phaseFromUrl, linkToken]);
 
   const total = questions.length;
   const q = questions[currentIndex];
@@ -176,19 +383,39 @@ const AssessmentApp = () => {
   };
 
   if (loading) {
-    return <div className="min-h-screen grid place-items-center text-muted-foreground">Loading assessment...</div>;
+    return (
+      <div className="min-h-screen grid place-items-center p-6">
+        <div className="text-center space-y-4 max-w-md">
+          <div className="inline-flex items-center gap-2 text-primary">
+            <RefreshCw size={18} className="animate-spin" />
+            <span className="font-display font-semibold text-lg">
+              Generating your assessment...
+            </span>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Each link produces a fresh set of questions tailored to your courseware.
+            This usually takes 30–60 seconds.
+          </p>
+          <LoadingProgressHint startedAt={generationStartedAt} />
+        </div>
+      </div>
+    );
   }
 
   if (loadError) {
     return (
       <div className="min-h-screen grid place-items-center p-6">
-        <div className="text-center space-y-3">
-          <p className="text-destructive">{loadError}</p>
+        <div className="text-center space-y-4 max-w-md">
+          <p className="text-destructive font-medium">{loadError}</p>
+          <p className="text-xs text-muted-foreground">
+            Your assessment link is still valid — retrying won&apos;t use up any
+            attempts. If this keeps failing, refresh in a few minutes.
+          </p>
           <button
-            onClick={() => setReloadKey((k) => k + 1)}
-            className="px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm"
+            onClick={requestNewQuestions}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm hover:opacity-90"
           >
-            Retry
+            <RefreshCw size={14} /> Try again
           </button>
         </div>
       </div>
@@ -211,15 +438,29 @@ const AssessmentApp = () => {
       <div className="w-full max-w-2xl">
         {/* Header */}
         <div className="mb-6">
-          <h1 className="font-display text-xl sm:text-2xl font-bold text-foreground mb-1">
-            CSM {assessmentType === "pre" ? "Pre" : "Post"} Assessment
-          </h1>
+          <div className="flex items-start justify-between gap-3 mb-1">
+            <h1 className="font-display text-xl sm:text-2xl font-bold text-foreground">
+              {assessmentType === "pre" ? "Pre" : "Post"} Assessment
+            </h1>
+            <button
+              onClick={requestNewQuestions}
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+              title="Discard the current set and request a new one from the model"
+            >
+              <RefreshCw size={12} /> Get new questions
+            </button>
+          </div>
           <div className="flex items-center justify-between text-sm text-muted-foreground mb-3">
             <span>Question {currentIndex + 1} of {total}</span>
             <span className="font-medium">
               {Object.keys(answers).length}/{total} answered
             </span>
           </div>
+          {restoredFromSession && (
+            <p className="text-[11px] text-muted-foreground mb-3">
+              Resuming where you left off in this tab. Refreshing keeps your answers.
+            </p>
+          )}
           {/* Progress bar */}
           <div className="h-1 rounded-full bg-progress-track overflow-hidden mb-3">
             <motion.div
@@ -301,6 +542,34 @@ const AssessmentApp = () => {
           </button>
         </div>
       </div>
+    </div>
+  );
+};
+
+type LoadingProgressHintProps = {
+  startedAt: number | null;
+};
+
+const LoadingProgressHint = ({ startedAt }: LoadingProgressHintProps) => {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!startedAt) return;
+    const t = window.setInterval(() => {
+      setElapsed(Math.max(0, Math.round((Date.now() - startedAt) / 1000)));
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [startedAt]);
+  if (!startedAt) return null;
+  const pct = Math.min(95, Math.round((elapsed / 60) * 100));
+  return (
+    <div className="space-y-1">
+      <div className="h-1 rounded-full bg-progress-track overflow-hidden">
+        <div
+          className="h-full rounded-full bg-primary transition-all"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <p className="text-[11px] text-muted-foreground">~{elapsed}s elapsed</p>
     </div>
   );
 };

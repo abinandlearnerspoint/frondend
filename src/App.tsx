@@ -4,6 +4,7 @@ import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import AssessmentApp from "@/components/AssessmentApp";
+import ModuleCurriculumAssessment from "@/components/ModuleCurriculumAssessment";
 import Index from "./pages/Index.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
@@ -23,6 +24,7 @@ const App = () => (
           {/* Legacy patterns kept for backwards compatibility. */}
           <Route path="/quiz/:phase/:id" element={<AssessmentApp />} />
           <Route path="/quiz/:id" element={<AssessmentApp />} />
+          <Route path="/assessment/from-modules" element={<ModuleCurriculumAssessment />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
         </Routes>
